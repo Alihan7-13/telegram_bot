@@ -184,71 +184,174 @@ def cmd_suggest(message):
 
     except Exception as e:
         print(f"Code Error: {e}")
-        bot.reply_to(message, "Внутренняя ошибка бота. Глянь логи Render.")
-@bot.message_handler(commands=['suggest_ac'])
+        bot.reply_to(message, "Внутренняя ошибка бота. Глянь логи Render.")@bot.message_handler(commands=['suggest_ac'])
 def cmd_suggest_ac(message):
+    global AC_PROBLEM_MODELS
     try:
         parts = message.text.split()
-        handle = parts[1] if len(parts) > 1 else "Alihan" # Твой ник на AC
+        handle = parts[1] if len(parts) > 1 else "Alihan"
         bot.send_chat_action(message.chat.id, 'typing')
 
-        # 1. Получаем решенные задачи пользователя через Kenkoooo
-        solved_url = f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}"
-        submissions = requests.get(solved_url, timeout=10).json()
-        solved_ids = {s['problem_id'] for s in submissions if s['result'] == 'AC'}
+        # 1. Получаем твой текущий рейтинг ABC
+        rating = 0
+        try:
+            # Аткуальный рейтинг лучше брать из истории (последний контест)
+            history = requests.get(f"https://atcoder.jp/users/{handle}/history/json", timeout=10).json()
+            if history:
+                rating = history[-1].get("NewRating", 0)
+        except: pass
 
-        # 2. Получаем сложность всех задач
-        # В AtCoder сложность — это не рейтинг в профиле, а число на Kenkoooo
-        all_diffs = requests.get("https://kenkoooo.com/atcoder/resources/problem-models.json").json()
-        
-        # 3. Получаем теги (Kenkoooo предоставляет их через неофициальные эндпоинты или просто берем по названию задачи)
-        # На AtCoder задачи обычно делятся по буквам (A, B, C, D...)
-        # Давай сделаем подбор по уровню сложности относительно твоего текущего уровня на AC
-        
-        # Получаем текущий рейтинг (Difficulty) пользователя
-        user_info = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/info?user={handle}").json()
-        user_rating = user_info.get('rating', 0) # Твой текущий рейтинг на AC
-        
-        # Диапазон сложности: твой рейтинг и ВЫШЕ (до +400, так как в AC разброс больше)
-        min_d, max_d = user_rating, user_rating + 400
-        if user_rating == 0: min_d, max_d = 0, 800
+        # 2. Получаем список того, что ты уже решил (Kenkoooo)
+        try:
+            subs = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}&from_second=0", timeout=15).json()
+            solved_ids = {s['problem_id'] for s in subs if s.get('result') == 'AC'}
+        except:
+            return bot.reply_to(message, "Ошибка API Kenkoooo. Попробуй позже.")
 
-        # 4. Фильтруем задачи
+        # 3. Загружаем базу сложности (один раз)
+        if AC_PROBLEM_MODELS is None:
+            AC_PROBLEM_MODELS = requests.get("https://kenkoooo.com/atcoder/resources/problem-models.json").json()
+
         import random
         pool = []
-        for p_id, data in all_diffs.items():
+        
+        # 4. Жесткий фильтр: ABC + Индекс D и выше
+        for p_id, data in AC_PROBLEM_MODELS.items():
+            # Проверка: только ABC
+            if not p_id.startswith('abc'):
+                continue
+            
+            # Проверка: только D, E, F, G (отсекаем A, B, C)
+            # Обычно p_id выглядит как 'abc200_d' или 'abc001_4'
+            parts_id = p_id.split('_')
+            if len(parts_id) < 2: continue
+            
+            suffix = parts_id[1].lower()
+            # Буквенные индексы для новых ABC и числовые (4=D, 5=E...) для очень старых
+            if suffix not in ['d', 'e', 'f', 'g', 'h', '4', '5', '6']:
+                continue
+
+            if p_id in solved_ids:
+                continue
+
             diff = data.get('difficulty')
-            if diff is not None and min_d <= diff <= max_d:
-                if p_id not in solved_ids:
-                    # Формируем ссылку. Обычно p_id выглядит как 'abc200_c'
-                    contest_id = p_id.split('_')[0]
-                    pool.append({'id': p_id, 'diff': diff, 'contest': contest_id})
+            if diff is None: continue
+
+            # ЛОГИКА СЛОЖНОСТИ: 
+            # Задачи должны быть твоего уровня или сложнее (минимум твой рейтинг - 100)
+            if diff >= (rating - 100):
+                pool.append({'id': p_id, 'diff': int(diff), 'letter': suffix.upper()})
 
         if not pool:
-            return bot.reply_to(message, "Не нашел подходящих задач на AtCoder.")
+            return bot.reply_to(message, "Не нашел подходящих D+ задач. Либо ты всё решил, либо слишком высокий запрос.")
 
+        # Выбираем задачу
         p = random.choice(pool)
-        link = f"https://atcoder.jp/contests/{p['contest']}/tasks/{p['id']}"
-        
-        # Цвета сложности в AtCoder
-        def get_color(d):
-            if d < 400: return "🟤 Brown"
-            if d < 800: return "🟢 Green"
-            if d < 1200: return "🔵 Cyan"
-            if d < 1600: return "🔵 Blue"
-            return "🟡 Yellow"
+        contest_id = p['id'].split('_')[0]
+        link = f"https://atcoder.jp/contests/{contest_id}/tasks/{p['id']}"
+
+        # Определяем "цвет" сложности для красоты
+        color = "🔘 Grey"
+        if p['diff'] >= 400: color = "🟤 Brown"
+        if p['diff'] >= 800: color = "🟢 Green"
+        if p['diff'] >= 1200: color = "🔵 Cyan"
+        if p['diff'] >= 1600: color = "🔵 Blue"
 
         response = (
-            f"🗾 <b>AtCoder Тренировка для {handle}</b>\n"
-            f"Твой рейтинг: <code>{user_rating}</code>\n"
-            f"Сложность задачи: <b>{p['diff']}</b> ({get_color(p['diff'])})\n\n"
-            f"🔗 <a href='{link}'>Перейти к задаче</a>"
+            f"🗾 <b>ABC Hard Training: {handle}</b>\n"
+            f"Твой рейтинг: <code>{rating}</code>\n"
+            f"Задача: <b>{p['letter']}</b>\n"
+            f"Сложность: <b>{p['diff']}</b> ({color})\n\n"
+            f"🔗 {link}"
         )
-        bot.reply_to(message, response, parse_mode="HTML", disable_web_page_preview=False)
+        bot.reply_to(message, response, parse_mode="HTML")
 
     except Exception as e:
-        print(f"AC Suggest Error: {e}")
-        bot.reply_to(message, "Ошибка при поиске задачи на AtCoder. Возможно, API Kenkoooo перегружен.")
+        print(f"AC Error: {e}")
+        bot.reply_to(message, "Бот не смог обработать запрос. Проверь ник или логи.")
+@bot.message_handler(commands=['audit'])
+def cmd_audit(message):
+    try:
+        parts = message.text.split()
+        cf_handle = parts[1] if len(parts) > 1 else "Alihan_7"
+        ac_handle = parts[2] if len(parts) > 2 else "Alihan"
+        bot.send_chat_action(message.chat.id, 'typing')
+
+        # 1. Сбор данных
+        cf_user = requests.get(f"https://codeforces.com/api/user.info?handles={cf_handle}").json()
+        cf_status = requests.get(f"https://codeforces.com/api/user.status?handle={cf_handle}").json()
+        ac_subs = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={ac_handle}&from_second=0").json()
+        
+        if cf_user['status'] != 'OK' or cf_status['status'] != 'OK':
+            return bot.reply_to(message, "Ошибка API Codeforces.")
+
+        rating = cf_user['result'][0].get('rating', 800)
+        
+        # 2. Темы из твоего Google Doc (Vital для Pupil/Specialist)
+        vital_tags = ["implementation", "math", "greedy", "brute force", "sortings", "strings"]
+        hard_tags = ["dp", "binary search", "number theory", "two pointers", "bitmasks"]
+        
+        stats = {tag: 0 for tag in vital_tags + hard_tags}
+        total_solved = 0
+        easy_tasks = 0 # Задачи намного ниже рейтинга
+
+        # Анализ CF
+        for sub in cf_status['result']:
+            if sub['verdict'] == 'OK':
+                p = sub['problem']
+                p_rating = p.get('rating', 0)
+                
+                # Не считаем "мусор" (задачи ниже рейтинга на 300+)
+                if p_rating < (rating - 300) and rating > 1000:
+                    easy_tasks += 1
+                    continue
+                
+                total_solved += 1
+                for tag in p.get('tags', []):
+                    if tag in stats:
+                        stats[tag] += 1
+
+        # Анализ AtCoder (считаем только D+)
+        ac_hard = sum(1 for s in ac_subs if s['result'] == 'AC' and s['problem_id'].split('_')[-1] in ['d', 'e', 'f', 'g'])
+
+        # 3. Формируем отчет
+        report = f"🧥 <b>Разбор полетов для {cf_handle}</b>\n"
+        report += f"Твой текущий уровень: <b>{rating}</b>\n"
+        report += f"Решено актуальных задач: <b>{total_solved}</b>\n\n"
+
+        issues = []
+        
+        # Проверка баланса Math vs Programming
+        math_ratio = stats['math'] / (total_solved if total_solved > 0 else 1)
+        if math_ratio > 0.4:
+            issues.append("⚠️ <b>Перебор с математикой:</b> Ты решаешь слишком много Math. На контестах тебя погубит Implementation.")
+        
+        # Проверка "Стены" (Сложные темы)
+        for tag in hard_tags:
+            if stats[tag] < 5:
+                issues.append(f"❌ <b>Провал в теме #{tag}:</b> Почти нет решенных задач. Без этого не стать Специалистом.")
+
+        # Проверка AtCoder
+        if ac_hard < 5:
+            issues.append("📉 <b>Слабая логика (AtCoder):</b> Слишком мало решенных D+ задач. Твой мозг не привык к Ad-hoc задачам.")
+        
+        # Проверка "Халявы"
+        if easy_tasks > total_solved:
+            issues.append("🤡 <b>Ложная уверенность:</b> Ты решаешь слишком много легких задач. Это не дает рейтинга, только тратит время.")
+
+        # Вывод
+        if not issues:
+            report += "✅ <b>Ты монстр!</b> Идешь по роадмапу идеально. Твой Pupil уже близко.\n"
+        else:
+            report += "<b>Твои косяки:</b>\n" + "\n".join(issues)
+
+        report += f"\n\n🚀 <b>Вердикт:</b> Тебе нужно забить на простые задачи и решить хотя бы 10 задач на <b>#{random.choice([t for t, v in stats.items() if v < 5] or ['dp'])}</b> сложности <b>{rating+100}</b>."
+        
+        bot.reply_to(message, report, parse_mode="HTML")
+
+    except Exception as e:
+        print(e)
+        bot.reply_to(message, "Бот запнулся при анализе. Проверь ники.")
 # --- Логика мониторинга ---
 def check_updates():
     while True:
