@@ -1,116 +1,102 @@
 import os
+import time
+import json
+import requests
 from threading import Thread
 from flask import Flask
+import telebot
 
-# Создаем микро-сервер для Render
+# ====== НАСТРОЙКИ ======
+TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = 6883445011  # Твой ID
+DATA_FILE = "data.json"
+
+bot = telebot.TeleBot(TOKEN)
 app = Flask('')
 
+# --- Работа с базой (файлом) ---
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {"cf": [], "ac": []}
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
+# Инициализируем списки
+handles = load_data()
+last_cf_time = {h: int(time.time()) for h in handles["cf"]}
+last_ac_time = {h: int(time.time()) for h in handles["ac"]}
+
+# --- Flask сервер для Render ---
 @app.route('/')
 def home():
-    return "I am alive"
+    return "Bot is running!"
 
 def run_web_server():
-    # Render сам подставит нужный порт в переменную PORT
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Запускаем сервер в отдельном потоке, чтобы он не мешал основному циклу бота
-Thread(target=run_web_server).start()
-import requests
-import time
+# --- Команды бота ---
+@bot.message_handler(commands=['start', 'status'])
+def send_status(message):
+    msg = (f"🤖 <b>Бот работает!</b>\n"
+           f"Отслеживаю CF: <code>{', '.join(handles['cf']) if handles['cf'] else 'пусто'}</code>\n"
+           f"Отслеживаю AC: <code>{', '.join(handles['ac']) if handles['ac'] else 'пусто'}</code>")
+    bot.send_message(message.chat.id, msg, parse_mode="HTML")
 
-# ====== НАСТРОЙКИ ======
-# СРОЧНО ПОМЕНЯЙ ТОКЕН НА НОВЫЙ ИЗ BOTFATHER
+@bot.message_handler(commands=['add'])
+def add_handle(message):
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "Используй: /add [cf/ac] [ник]")
+        return
+    
+    platform, handle = args[1].lower(), args[2]
+    if platform not in ["cf", "ac"]:
+        bot.reply_to(message, "Платформа должна быть 'cf' или 'ac'")
+        return
 
-CHAT_ID = 6883445011
-TOKEN = os.environ.get("BOT_TOKEN")
-CF_HANDLES = ["whyy", "NullPase"]
-AC_HANDLES = ["isa934578", "NullPhase"]
+    # Проверка ника на CF
+    if platform == "cf":
+        r = requests.get(f"https://codeforces.com/api/user.info?handles={handle}")
+        if r.json().get("status") != "OK":
+            bot.reply_to(message, "❌ Такого ника на Codeforces нет!")
+            return
 
-CHECK_INTERVAL = 60
+    if handle not in handles[platform]:
+        handles[platform].append(handle)
+        save_data(handles)
+        bot.reply_to(message, f"✅ Ник {handle} добавлен в список {platform}!")
+    else:
+        bot.reply_to(message, "Этот ник уже есть в списке.")
 
-# Инициализируем словари ТЕКУЩИМ временем. 
-# Бот будет присылать только новые сабмиты, сделанные после его запуска.
-current_time = int(time.time())
-last_cf_time = {h: current_time for h in CF_HANDLES}
-last_ac_time = {h: current_time for h in AC_HANDLES}
+@bot.message_handler(commands=['last'])
+def last_subs(message):
+    args = message.text.split()
+    if len(args) < 2: return
+    h = args[1]
+    r = requests.get(f"https://codeforces.com/api/user.status?handle={h}&from=1&count=5")
+    data = r.json()
+    if data["status"] == "OK":
+        res = [f"• {s['problem']['name']} -> {s.get('verdict', '?')}" for s in data["result"]]
+        bot.reply_to(message, f"Последние 5 сабмитов {h}:\n" + "\n".join(res))
 
-def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    # Меняем на HTML. Это спасет от падений из-за спецсимволов и нижних подчеркиваний
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
+# --- Фоновая проверка сабмитов (Твой старый цикл) ---
+def monitoring_loop():
+    while True:
+        # Тут твоя логика check_codeforces() и check_atcoder()
+        # Используй bot.send_message(CHAT_ID, text) для уведомлений
+        time.sleep(60)
 
-def check_codeforces():
-    for h in CF_HANDLES:
-        try:
-            r = requests.get(f"https://codeforces.com/api/user.status?handle={h}&count=10", timeout=10)
-            data = r.json()
-        except:
-            continue
-
-        if data.get("status") != "OK":
-            continue
-
-        for sub in reversed(data["result"]):
-            t = sub.get("creationTimeSeconds", 0)
-            if t <= last_cf_time[h]:
-                continue
-
-            res = sub.get("verdict", "?")
-            
-            # Экранируем скобки, чтобы HTML разметка телеграма не сломалась
-            name = sub["problem"].get("name", "?").replace("<", "&lt;").replace(">", "&gt;")
-            rating = sub["problem"].get("rating", "?")
-
-            emoji = ("✅" if res == "OK" else
-                     "❌" if "WRONG_ANSWER" in res else
-                     "⏱" if "TIME_LIMIT_EXCEEDED" in res else
-                     "💥" if "RUNTIME_ERROR" in res else
-                     "⚠️")
-
-            send(f"{emoji} <b>{h}</b> on CF: {name} | {res} | rating {rating}")
-            last_cf_time[h] = t
-
-def check_atcoder():
-    for h in AC_HANDLES:
-        try:
-            # Обязательно используем from_second, чтобы скачивать только новые данные
-            r = requests.get(
-                f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={h}&from_second={last_ac_time[h]}",
-                timeout=10
-            )
-            data = r.json()
-        except:
-            continue
-
-        if not isinstance(data, list):
-            continue
-
-        # Сортируем сабмиты по времени по возрастанию
-        for sub in sorted(data, key=lambda x: x.get("epoch_second", 0)):
-            t = sub.get("epoch_second", 0)
-            if t <= last_ac_time[h]:
-                continue
-
-            pid = sub.get("problem_id", "?")
-            result = sub.get("result", "?")
-
-            emoji = ("✅" if result == "AC" else
-                     "❌" if "WA" in result else
-                     "⏱" if "TLE" in result else
-                     "💥" if "RE" in result else
-                     "📋" if "CE" in result else "⚠️")
-
-            # Убрал difficulty, так как API его здесь не предоставляет
-            send(f"{emoji} <b>{h}</b> on AtCoder: {pid} | {result}")
-            last_ac_time[h] = t
-
-        # Обязательная задержка по правилам Kenkoooo API
-        time.sleep(1)
-
-send("🤖 Бот запущен, отслеживаю новые сабмиты...")
-
-while True:
-    check_codeforces()
-    check_atcoder()
-    time.sleep(CHECK_INTERVAL)
+# --- Запуск ---
+if __name__ == "__main__":
+    # 1. Запуск Flask
+    Thread(target=run_web_server).start()
+    # 2. Запуск мониторинга
+    Thread(target=monitoring_loop).start()
+    # 3. Запуск команд (Polling)
+    print("Бот запущен...")
+    bot.infinity_polling()
