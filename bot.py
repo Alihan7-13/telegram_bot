@@ -1,11 +1,29 @@
+import os
+from threading import Thread
+from flask import Flask
+
+# Создаем микро-сервер для Render
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I am alive"
+
+def run_web_server():
+    # Render сам подставит нужный порт в переменную PORT
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Запускаем сервер в отдельном потоке, чтобы он не мешал основному циклу бота
+Thread(target=run_web_server).start()
 import requests
 import time
 
 # ====== НАСТРОЙКИ ======
 # СРОЧНО ПОМЕНЯЙ ТОКЕН НА НОВЫЙ ИЗ BOTFATHER
-TOKEN = "8617063898:AAF2zVroZjz1mN0B3vfosL71Clf3x0i-PuY"
-CHAT_ID = 6883445011
 
+CHAT_ID = 6883445011
+TOKEN = os.environ.get("BOT_TOKEN")
 CF_HANDLES = ["whyy", "NullPase"]
 AC_HANDLES = ["isa934578", "NullPhase"]
 
