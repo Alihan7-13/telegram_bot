@@ -185,6 +185,70 @@ def cmd_suggest(message):
     except Exception as e:
         print(f"Code Error: {e}")
         bot.reply_to(message, "Внутренняя ошибка бота. Глянь логи Render.")
+@bot.message_handler(commands=['suggest_ac'])
+def cmd_suggest_ac(message):
+    try:
+        parts = message.text.split()
+        handle = parts[1] if len(parts) > 1 else "Alihan" # Твой ник на AC
+        bot.send_chat_action(message.chat.id, 'typing')
+
+        # 1. Получаем решенные задачи пользователя через Kenkoooo
+        solved_url = f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}"
+        submissions = requests.get(solved_url, timeout=10).json()
+        solved_ids = {s['problem_id'] for s in submissions if s['result'] == 'AC'}
+
+        # 2. Получаем сложность всех задач
+        # В AtCoder сложность — это не рейтинг в профиле, а число на Kenkoooo
+        all_diffs = requests.get("https://kenkoooo.com/atcoder/resources/problem-models.json").json()
+        
+        # 3. Получаем теги (Kenkoooo предоставляет их через неофициальные эндпоинты или просто берем по названию задачи)
+        # На AtCoder задачи обычно делятся по буквам (A, B, C, D...)
+        # Давай сделаем подбор по уровню сложности относительно твоего текущего уровня на AC
+        
+        # Получаем текущий рейтинг (Difficulty) пользователя
+        user_info = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/info?user={handle}").json()
+        user_rating = user_info.get('rating', 0) # Твой текущий рейтинг на AC
+        
+        # Диапазон сложности: твой рейтинг и ВЫШЕ (до +400, так как в AC разброс больше)
+        min_d, max_d = user_rating, user_rating + 400
+        if user_rating == 0: min_d, max_d = 0, 800
+
+        # 4. Фильтруем задачи
+        import random
+        pool = []
+        for p_id, data in all_diffs.items():
+            diff = data.get('difficulty')
+            if diff is not None and min_d <= diff <= max_d:
+                if p_id not in solved_ids:
+                    # Формируем ссылку. Обычно p_id выглядит как 'abc200_c'
+                    contest_id = p_id.split('_')[0]
+                    pool.append({'id': p_id, 'diff': diff, 'contest': contest_id})
+
+        if not pool:
+            return bot.reply_to(message, "Не нашел подходящих задач на AtCoder.")
+
+        p = random.choice(pool)
+        link = f"https://atcoder.jp/contests/{p['contest']}/tasks/{p['id']}"
+        
+        # Цвета сложности в AtCoder
+        def get_color(d):
+            if d < 400: return "🟤 Brown"
+            if d < 800: return "🟢 Green"
+            if d < 1200: return "🔵 Cyan"
+            if d < 1600: return "🔵 Blue"
+            return "🟡 Yellow"
+
+        response = (
+            f"🗾 <b>AtCoder Тренировка для {handle}</b>\n"
+            f"Твой рейтинг: <code>{user_rating}</code>\n"
+            f"Сложность задачи: <b>{p['diff']}</b> ({get_color(p['diff'])})\n\n"
+            f"🔗 <a href='{link}'>Перейти к задаче</a>"
+        )
+        bot.reply_to(message, response, parse_mode="HTML", disable_web_page_preview=False)
+
+    except Exception as e:
+        print(f"AC Suggest Error: {e}")
+        bot.reply_to(message, "Ошибка при поиске задачи на AtCoder. Возможно, API Kenkoooo перегружен.")
 # --- Логика мониторинга ---
 def check_updates():
     while True:
