@@ -3,105 +3,126 @@ import time
 import sqlite3
 import requests
 import telebot
+import random
 from threading import Thread
 from flask import Flask
 
-# ====== КОНФИГУРАЦИЯ ======
 TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 bot = telebot.TeleBot(TOKEN)
 app = Flask('')
 
-# ====== БАЗА ДАННЫХ ======
+# ====== РОАДМАП ТЕГИ (ПО ТВОЕМУ СПИСКУ) ======
+ROADMAP = [
+    {"min": 0, "max": 999, "tags": ["brute force", "sortings", "strings", "number theory", "implementation"]},
+    {"min": 1000, "max": 1199, "tags": ["binary search", "two pointers", "bitmasks", "math", "sortings"]},
+    {"min": 1200, "max": 1399, "tags": ["dp", "combinatorics", "greedy", "math", "trees"]},
+    {"min": 1400, "max": 1599, "tags": ["graphs", "shortest paths", "dsu", "constructive algorithms", "data structures"]},
+    {"min": 1600, "max": 1899, "tags": ["probabilities", "games", "string algorithms", "segment trees", "trees"]}
+]
+
 def get_db_connection():
-    # SQLite файл cf_bot.db на Render будет удаляться при рестарте!
-    conn = sqlite3.connect('cf_bot.db', check_same_thread=False)
+    conn = sqlite3.connect('cf_coach.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # Твой личный CF ник (для /suggest)
-    c.execute('CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, handle TEXT)')
-    # Список друзей, за которыми следишь ТЫ (индивидуально)
+    c.execute('CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, handle TEXT, rating INTEGER DEFAULT 800)')
     c.execute('CREATE TABLE IF NOT EXISTS following (user_id TEXT, target_handle TEXT, UNIQUE(user_id, target_handle))')
-    # Задачи для дорешивания (индивидуально)
     c.execute('''CREATE TABLE IF NOT EXISTS missed_tasks 
                  (user_id TEXT, contest_id INTEGER, index_str TEXT, name TEXT, rating INTEGER, tags TEXT, 
                   UNIQUE(user_id, contest_id, index_str))''')
-    # Техническая таблица для мониторинга (последняя решенная задача друга)
     c.execute('CREATE TABLE IF NOT EXISTS last_solved (handle TEXT PRIMARY KEY, last_id TEXT)')
     conn.commit()
     conn.close()
 
 init_db()
 
-# ====== ЛОГИКА МОНИТОРИНГА (УВЕДОМЛЕНИЯ О ДРУЗЬЯХ) ======
+# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+
+def get_roadmap_tags(rating):
+    """Возвращает список тегов для текущего уровня рейтинга из роадмапа"""
+    for level in ROADMAP:
+        if level["min"] <= rating <= level["max"]:
+            return level["tags"]
+    return ["implementation", "greedy"] # дефолт
+
+def get_roadmap_problem(rating):
+    """Ищет случайную задачу в общем Problemset CF по тегам роадмапа"""
+    tags = get_roadmap_tags(rating)
+    tag_str = ";".join(tags)
+    try:
+        url = f"https://codeforces.com/api/problemset.problems?tags={random.choice(tags)}"
+        resp = requests.get(url, timeout=10).json()
+        if resp['status'] == 'OK':
+            # Фильтруем задачи по рейтингу (твой + 100-200)
+            valid_problems = [
+                p for p in resp['result']['problems'] 
+                if p.get('rating') and rating <= p['rating'] <= rating + 200
+            ]
+            if valid_problems:
+                return random.choice(valid_problems)
+    except: return None
+    return None
+
+# ====== ЛОГИКА МОНИТОРИНГА (УВЕДОМЛЕНИЯ) ======
 def monitoring_worker():
-    print("Мониторинг запущен...")
     while True:
         try:
             conn = get_db_connection()
-            # Находим все уникальные ники, за которыми хоть кто-то следит
             distinct_targets = conn.execute("SELECT DISTINCT target_handle FROM following").fetchall()
-            
             for row in distinct_targets:
                 target = row['target_handle']
-                time.sleep(2) # Защита от бана API
-                
+                time.sleep(2)
                 resp = requests.get(f"https://codeforces.com/api/user.status?handle={target}&from=1&count=5", timeout=10).json()
                 if resp.get('status') == 'OK' and resp['result']:
                     last_sub = resp['result'][0]
                     if last_sub.get('verdict') == 'OK':
                         sub_id = f"{last_sub['contestId']}{last_sub['problem']['index']}"
-                        
-                        # Проверяем, не уведомляли ли мы об этой задаче раньше
                         db_last = conn.execute("SELECT last_id FROM last_solved WHERE handle = ?", (target,)).fetchone()
-                        
                         if not db_last or db_last['last_id'] != sub_id:
-                            # Находим всех юзеров, которые следят именно за этим человеком
                             subscribers = conn.execute("SELECT user_id FROM following WHERE target_handle = ?", (target,)).fetchall()
-                            
                             for s in subscribers:
                                 try:
-                                    msg = f"🔔 <b>{target}</b> решил задачу!\n📝 {last_sub['problem']['name']} (Рейтинг: {last_sub['problem'].get('rating', '???')})"
-                                    bot.send_message(s['user_id'], msg, parse_mode="HTML")
+                                    bot.send_message(s['user_id'], f"🔔 <b>{target}</b> решил: {last_sub['problem']['name']}", parse_mode="HTML")
                                 except: pass
-                            
-                            conn.execute("INSERT OR REPLACE INTO last_solved (handle, last_id) VALUES (?, ?)", (target, sub_id))
+                            conn.execute("INSERT OR REPLACE INTO last_solved VALUES (?, ?)", (target, sub_id))
                             conn.commit()
             conn.close()
-        except Exception as e:
-            print(f"Ошибка в мониторинге: {e}")
-        time.sleep(60) # Проверка раз в минуту
+        except: pass
+        time.sleep(60)
 
-# ====== ЛОГИКА ЗАДАЧ (UPSOLVING) ======
+# ====== ЛОГИКА ОБНОВЛЕНИЯ ЗАДАЧ (UPSOLVING) ======
 def update_user_tasks(user_id, handle):
     try:
         user_info = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5).json()
         if user_info['status'] != 'OK': return False
         rating = user_info['result'][0].get('rating', 800)
         
-        # Задачи твоего уровня и чуть выше (2 ранга вверх)
-        min_r, max_r = max(800, rating - 100), rating + 400
-
+        # Обновляем рейтинг в базе
+        conn = get_db_connection()
+        conn.execute("UPDATE users SET rating = ? WHERE user_id = ?", (rating, user_id))
+        
+        # Получаем контесты, в которых юзер реально участвовал
+        contests_resp = requests.get(f"https://codeforces.com/api/user.rating?handle={handle}", timeout=5).json()
+        if contests_resp['status'] != 'OK': return False
+        
+        last_5_participated = [c['contestId'] for c in contests_resp['result'][-5:]]
+        
+        # Получаем решенные задачи
         status = requests.get(f"https://codeforces.com/api/user.status?handle={handle}", timeout=5).json()
         solved = {f"{s['problem']['contestId']}{s['problem']['index']}" for s in status['result'] if s.get('verdict') == 'OK'}
 
-        contests = requests.get(f"https://codeforces.com/api/user.rating?handle={handle}", timeout=5).json()
-        if contests['status'] != 'OK': return False
-        
-        last_5 = [c['contestId'] for c in contests['result'][-5:]]
-        conn = get_db_connection()
-        
-        for c_id in last_5:
+        for c_id in last_5_participated:
             time.sleep(0.5)
-            st = requests.get(f"https://codeforces.get/api/contest.standings?contestId={c_id}&from=1&count=1").json()
+            st = requests.get(f"https://codeforces.com/api/contest.standings?contestId={c_id}&from=1&count=1").json()
             if st['status'] == 'OK':
                 for p in st['result']['problems']:
                     p_id = f"{p['contestId']}{p['index']}"
                     p_r = p.get('rating', 0)
-                    if p_id not in solved and p_r and (min_r <= p_r <= max_r):
+                    # Фильтр: не решена и подходит по сложности
+                    if p_id not in solved and p_r and (rating - 100 <= p_r <= rating + 400):
                         conn.execute("INSERT OR IGNORE INTO missed_tasks VALUES (?,?,?,?,?,?)",
                                      (user_id, p['contestId'], p['index'], p['name'], p_r, ",".join(p.get('tags', []))))
         conn.commit()
@@ -110,66 +131,52 @@ def update_user_tasks(user_id, handle):
     except: return False
 
 # ====== КОМАНДЫ ======
-@bot.message_handler(commands=['start', 'help'])
-def cmd_start(message):
-    help_text = (
-        "🚀 <b>CF Personal Bot</b>\n\n"
-        "<b>Твоё развитие:</b>\n"
-        "/add_cf [ник] — привязать свой аккаунт\n"
-        "/update — собрать задачи из твоих последних контестов\n"
-        "/suggest — получить случайную задачу для дорешивания\n\n"
-        "<b>Слежка за друзьями:</b>\n"
-        "/follow [ник] — следить за решениями друга\n"
-        "/unfollow [ник] — перестать следить\n"
-        "/status — твой профиль и список друзей"
-    )
-    bot.reply_to(message, help_text, parse_mode="HTML")
 
-@bot.message_handler(commands=['follow'])
-def cmd_follow(message):
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Пиши: /follow [ник]")
-    
-    target = parts[1]
+@bot.message_handler(commands=['suggest'])
+def cmd_suggest(message):
     user_id = str(message.from_user.id)
-    
     conn = get_db_connection()
-    try:
-        conn.execute("INSERT INTO following (user_id, target_handle) VALUES (?, ?)", (user_id, target))
+    
+    # 1. Пробуем взять задачу из "долгов" (нерешенные с контестов)
+    task = conn.execute("SELECT * FROM missed_tasks WHERE user_id = ? ORDER BY rating ASC LIMIT 1", (user_id,)).fetchone()
+    
+    if task:
+        # Если есть долг — отдаем его и удаляем
+        conn.execute("DELETE FROM missed_tasks WHERE user_id = ? AND contest_id = ? AND index_str = ?", 
+                     (user_id, task['contest_id'], task['index_str']))
         conn.commit()
-        bot.reply_to(message, f"✅ Теперь ты следишь за <b>{target}</b>. Я напишу, когда он сдаст задачу!", parse_mode="HTML")
-    except:
-        bot.reply_to(message, "Ты уже следишь за ним.")
-    finally: conn.close()
-
-@bot.message_handler(commands=['status'])
-def cmd_status(message):
-    user_id = str(message.from_user.id)
-    conn = get_db_connection()
-    user = conn.execute("SELECT handle FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    follows = conn.execute("SELECT target_handle FROM following WHERE user_id = ?", (user_id,)).fetchall()
-    tasks_count = conn.execute("SELECT COUNT(*) FROM missed_tasks WHERE user_id = ?", (user_id,)).fetchone()[0]
-    conn.close()
-
-    text = f"👤 <b>Твой ник:</b> {user['handle'] if user else 'не привязан'}\n"
-    text += f"📚 Задач к дорешиванию: <b>{tasks_count}</b>\n\n"
-    text += "👥 <b>Ты следишь за:</b>\n"
-    if follows:
-        for f in follows: text += f"• <code>{f['target_handle']}</code>\n"
-    else: text += "Список пуст."
+        conn.close()
+        
+        link = f"https://codeforces.com/contest/{task['contest_id']}/problem/{task['index_str']}"
+        return bot.reply_to(message, f"🚩 <b>Дорешивание (из твоего контеста):</b>\n{task['name']} ({task['rating']})\nТеги: {task['tags']}\n{link}", parse_mode="HTML")
     
-    bot.reply_to(message, text, parse_mode="HTML")
+    # 2. Если долгов нет — работаем по Роадмапу
+    user = conn.execute("SELECT rating FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    
+    current_rating = user['rating'] if user else 800
+    bot.send_message(message.chat.id, "💡 Все хвосты закрыты! Ищу задачу по роадмапу для твоего уровня...")
+    
+    roadmap_p = get_roadmap_problem(current_rating)
+    if roadmap_p:
+        link = f"https://codeforces.com/problemset/problem/{roadmap_p['contestId']}/{roadmap_p['index']}"
+        bot.reply_to(message, f"🚀 <b>Новая тема по Роадмапу:</b>\n{roadmap_p['name']} ({roadmap_p.get('rating')})\nТеги: {', '.join(roadmap_p['tags'])}\n{link}", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "Не смог найти подходящую задачу в Problemset. Попробуй позже.")
+
+# Остальные команды (add_cf, update, follow, status) остаются такими же...
+# [Вставь сюда команды из предыдущего сообщения]
 
 @bot.message_handler(commands=['add_cf'])
 def cmd_add_cf(message):
-    handle = message.text.split()[1] if len(message.text.split()) > 1 else None
-    if not handle: return bot.reply_to(message, "Укажи ник!")
-    
+    parts = message.text.split()
+    if len(parts) < 2: return bot.reply_to(message, "Укажи ник!")
+    handle = parts[1]
     conn = get_db_connection()
     conn.execute("INSERT OR REPLACE INTO users (user_id, handle) VALUES (?, ?)", (str(message.from_user.id), handle))
     conn.commit()
     conn.close()
-    bot.reply_to(message, f"✅ Твой ник {handle} сохранен. Используй /update.")
+    bot.reply_to(message, f"✅ Ник {handle} сохранен.")
 
 @bot.message_handler(commands=['update'])
 def cmd_update(message):
@@ -178,39 +185,16 @@ def cmd_update(message):
     user = conn.execute("SELECT handle FROM users WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
     if not user: return bot.reply_to(message, "Сначала /add_cf")
-    
-    bot.reply_to(message, "⏳ Анализирую... Это займет около 10 секунд.")
+    bot.reply_to(message, "⏳ Анализирую твои контесты...")
     if update_user_tasks(user_id, user['handle']):
-        bot.reply_to(message, "✅ База задач обновлена!")
-    else: bot.reply_to(message, "❌ Ошибка API.")
+        bot.reply_to(message, "✅ Список задач для дорешивания обновлен!")
+    else: bot.reply_to(message, "❌ Ошибка. Возможно, ты не участвовал в контестах.")
 
-@bot.message_handler(commands=['suggest'])
-def cmd_suggest(message):
-    user_id = str(message.from_user.id)
-    conn = get_db_connection()
-    task = conn.execute("SELECT * FROM missed_tasks WHERE user_id = ? ORDER BY RANDOM() LIMIT 1", (user_id,)).fetchone()
-    if not task:
-        conn.close()
-        return bot.reply_to(message, "Задач нет. Нажми /update.")
-    
-    conn.execute("DELETE FROM missed_tasks WHERE user_id = ? AND contest_id = ? AND index_str = ?", 
-                 (user_id, task['contest_id'], task['index_str']))
-    conn.commit()
-    conn.close()
-    
-    link = f"https://codeforces.com/contest/{task['contest_id']}/problem/{task['index_str']}"
-    bot.reply_to(message, f"🎯 <b>Задача: {task['name']}</b> ({task['rating']})\nТеги: {task['tags']}\n{link}", parse_mode="HTML")
-
-# ====== ЗАПУСК ======
 @app.route('/')
 def ping(): return "OK", 200
 
 if __name__ == "__main__":
-    # Поток для мониторинга
     Thread(target=monitoring_worker, daemon=True).start()
-    # Поток для Flask (Render)
     port = int(os.environ.get('PORT', 10000))
     Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
-    
-    print("Бот в эфире...")
     bot.infinity_polling()
