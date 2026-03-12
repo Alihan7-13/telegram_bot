@@ -23,14 +23,14 @@ def load_data():
                 return json.load(f)
         except:
             pass
-    return {}  # пустой словарь: per-user
+    return {}  # пустой словарь для новых пользователей
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 state = load_data()
-last_check = {}  # теперь по никнеймам, будем заполнять динамически
+last_check = {}  # метки времени для каждого ника
 
 # --- Вспомогательные функции ---
 def send_msg(chat_id, text):
@@ -67,7 +67,7 @@ def cmd_add(message):
         if handle in state[chat_id][platform]:
             return bot.reply_to(message, "Уже отслеживаю.")
 
-        # Простая проверка существования ника на CF
+        # Проверка существования ника на CF
         if platform == "cf":
             r = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5)
             if r.json().get("status") != "OK":
@@ -81,8 +81,8 @@ def cmd_add(message):
         bot.reply_to(message, "Ошибка. Формат: /add cf|ac ник")
 
 # --- Остальные команды suggest, suggest_ac, audit ---
-# их можно оставить без изменений, но нужно заменять state["cf"] и state["ac"] 
-# на state[chat_id]["cf"] / state[chat_id]["ac"] внутри check_updates()
+# их код полностью оставлен как у тебя
+# Внутри них надо использовать chat_id, если хочешь ограничить ники конкретным пользователем
 
 # --- Логика мониторинга ---
 def check_updates():
