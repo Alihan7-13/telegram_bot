@@ -9,7 +9,6 @@ from flask import Flask
 
 # ====== КОНФИГУРАЦИЯ ======
 TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = 6883445011 # ID для уведомлений о мониторинге
 DATA_FILE = "data.json"
 CHECK_INTERVAL = 60
 
@@ -22,160 +21,116 @@ def load_data():
         try:
             with open(DATA_FILE, "r") as f:
                 return json.load(f)
-        except: pass
-    return {
-        "cf_users": {}, # {user_id: {"handle": "...", "rating": 800, "debts": []}}
-        "monitored_cf": ["whyy", "NullPase"], 
-        "monitored_ac": ["isa934578", "NullPhase"]
-    }
+        except:
+            pass
+    return {}  # пустой словарь: per-user
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+        json.dump(data, f, indent=2)
 
 state = load_data()
-# Для мониторинга новых решений
-last_check = {h: int(time.time()) for h in state["monitored_cf"] + state["monitored_ac"]}
+last_check = {}  # теперь по никнеймам, будем заполнять динамически
 
-# --- Логика Codeforces Долгов ---
-def sync_cf_debts(user_id):
-    u_data = state["cf_users"].get(str(user_id))
-    if not u_data: return "no_handle"
-    
-    handle = u_data["handle"]
+# --- Вспомогательные функции ---
+def send_msg(chat_id, text):
     try:
-        # 1. Получаем рейтинг
-        user_info = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=10).json()
-        if user_info['status'] == 'OK':
-            u_data["rating"] = user_info['result'][0].get('rating', 800)
-        
-        # 2. Получаем последние 5 контестов пользователя
-        hist = requests.get(f"https://codeforces.com/api/user.rating?handle={handle}", timeout=10).json()
-        if hist['status'] != 'OK': return "api_error"
-        
-        my_contests = [c['contestId'] for c in hist['result'][-5:]]
-        
-        # 3. Список уже решенных задач
-        status = requests.get(f"https://codeforces.com/api/user.status?handle={handle}", timeout=10).json()
-        solved = {f"{s['problem']['contestId']}{s['problem']['index']}" for s in status['result'] if s.get('verdict') == 'OK'}
-        
-        # 4. Собираем нерешенные задачи из этих контестов
-        new_debts = []
-        for c_id in my_contests:
-            standings = requests.get(f"https://codeforces.com/api/contest.standings?contestId={c_id}&from=1&count=1").json()
-            if standings['status'] == 'OK':
-                for p in standings['result']['problems']:
-                    p_id = f"{p['contestId']}{p['index']}"
-                    p_rating = p.get('rating', 0)
-                    # Если не решена и подходит по сложности (-100... +400)
-                    if p_id not in solved and p_rating and (u_data["rating"] - 100 <= p_rating <= u_data["rating"] + 400):
-                        new_debts.append({
-                            "id": p_id,
-                            "name": p['name'],
-                            "rating": p_rating,
-                            "link": f"https://codeforces.com/contest/{p['contestId']}/problem/{p['index']}"
-                        })
-            time.sleep(0.5)
-            
-        u_data["debts"] = new_debts
-        save_data(state)
-        return "success"
+        bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception as e:
-        print(f"Sync error: {e}")
-        return "fatal_error"
+        print(f"Ошибка отправки: {e}")
 
 # --- Команды бота ---
-
-@bot.message_handler(commands=['add_cf'])
-def cmd_add_cf(message):
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Используй: /add_cf твой_ник")
-    
-    handle = parts[1]
-    user_id = str(message.from_user.id)
-    
-    state["cf_users"][user_id] = {"handle": handle, "rating": 800, "debts": []}
-    save_data(state)
-    bot.reply_to(message, f"✅ Ник {handle} привязан! Нажми /update, чтобы собрать долги.")
-
-
-@bot.message_handler(commands=['update'])
-def cmd_update(message):
-    uid = str(message.from_user.id)
-    if uid not in state["cf_users"]: return bot.reply_to(message, "Сначала /add_cf")
-    
-    msg = bot.reply_to(message, "🔍 Проверяю твои последние 5 контестов...")
-    res = sync_cf_debts(uid)
-    
-    if res == "success":
-        count = len(state["cf_users"][uid]["debts"])
-        bot.edit_message_text(f"✅ Готово! Найдено долгов: {count}", msg.chat.id, msg.message_id)
-    else:
-        bot.edit_message_text(f"❌ Ошибка при обновлении. Попробуй позже.", msg.chat.id, msg.message_id)
-
-@bot.message_handler(commands=['suggest'])
-def cmd_suggest(message):
-    uid = str(message.from_user.id)
-    if uid not in state["cf_users"]: return bot.reply_to(message, "Сначала /add_cf")
-    
-    u_data = state["cf_users"][uid]
-    
-    # 1. Сначала даем задачу из долгов (контестов)
-    if u_data["debts"]:
-        task = random.choice(u_data["debts"])
-        response = (
-            f"🚩 <b>Долг из контеста:</b>\n"
-            f"Задача: {task['name']} ({task['rating']})\n"
-            f"🔗 {task['link']}"
-        )
-        return bot.reply_to(message, response, parse_mode="HTML")
-    
-    # 2. Если долгов нет - старая логика роадмапа (упрощенно для примера)
-    bot.reply_to(message, "💡 Долгов нет! Ищу задачу по общему роадмапу...")
-    # Тут можно вызвать вашу функцию get_roadmap_problem из первого кода
-
-@bot.message_handler(commands=['status'])
+@bot.message_handler(commands=['start', 'status'])
 def cmd_status(message):
-    uid = str(message.from_user.id)
-    if uid in state["cf_users"]:
-        u = state["cf_users"][uid]
-        text = (f"👤 <b>Ник:</b> {u['handle']}\n"
-                f"📈 <b>Рейтинг:</b> {u['rating']}\n"
-                f"📚 <b>Долгов:</b> {len(u['debts'])}")
-    else:
-        text = "Вы не зарегистрированы. Используйте /add_cf"
-    bot.reply_to(message, text, parse_mode="HTML")
+    chat_id = str(message.chat.id)
+    user_data = state.get(chat_id, {"cf": [], "ac": []})
+    status_text = (
+        "🟢 <b>Бот активен</b>\n\n"
+        f"👥 CF: <code>{', '.join(user_data['cf'])}</code>\n"
+        f"👥 AC: <code>{', '.join(user_data['ac'])}</code>\n"
+        f"📈 Интервал: {CHECK_INTERVAL} сек"
+    )
+    bot.reply_to(message, status_text, parse_mode="HTML")
 
-# --- Мониторинг (из вашего 1-го кода) ---
-def send_msg(text):
-    try: bot.send_message(CHAT_ID, text, parse_mode="HTML")
-    except: pass
+@bot.message_handler(commands=['add'])
+def cmd_add(message):
+    chat_id = str(message.chat.id)
+    if chat_id not in state:
+        state[chat_id] = {"cf": [], "ac": []}
 
+    try:
+        _, platform, handle = message.text.split()
+        platform = platform.lower()
+        if platform not in ["cf", "ac"]:
+            return bot.reply_to(message, "Используй: /add [cf/ac] [ник]")
+
+        if handle in state[chat_id][platform]:
+            return bot.reply_to(message, "Уже отслеживаю.")
+
+        # Простая проверка существования ника на CF
+        if platform == "cf":
+            r = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5)
+            if r.json().get("status") != "OK":
+                return bot.reply_to(message, "❌ Ник не найден на CF")
+
+        state[chat_id][platform].append(handle)
+        last_check[handle] = int(time.time())
+        save_data(state)
+        bot.reply_to(message, f"✅ {handle} добавлен!")
+    except:
+        bot.reply_to(message, "Ошибка. Формат: /add cf|ac ник")
+
+# --- Остальные команды suggest, suggest_ac, audit ---
+# их можно оставить без изменений, но нужно заменять state["cf"] и state["ac"] 
+# на state[chat_id]["cf"] / state[chat_id]["ac"] внутри check_updates()
+
+# --- Логика мониторинга ---
 def check_updates():
     while True:
-        # Мониторинг CF (короткий список для уведомлений)
-        for h in state["monitored_cf"]:
-            try:
-                r = requests.get(f"https://codeforces.com/api/user.status?handle={h}&from=1&count=5", timeout=10).json()
-                if r.get("status") == "OK":
-                    for sub in reversed(r["result"]):
-                        tm = sub.get("creationTimeSeconds", 0)
+        for chat_id, user_data in state.items():
+            # --- Codeforces ---
+            for h in user_data["cf"]:
+                try:
+                    r = requests.get(f"https://codeforces.com/api/user.status?handle={h}&from=1&count=10", timeout=10).json()
+                    if r.get("status") == "OK":
+                        for sub in reversed(r["result"]):
+                            tm = sub.get("creationTimeSeconds", 0)
+                            if tm > last_check.get(h, 0):
+                                res = sub.get("verdict", "TESTING")
+                                if res == "TESTING": continue
+                                p = sub["problem"]
+                                emoji = "✅" if res == "OK" else "❌"
+                                send_msg(chat_id, f"{emoji} <b>{h}</b> (CF): {p['name']} [{p.get('rating','?')}] | {res}")
+                                last_check[h] = tm
+                except Exception as e:
+                    print(f"CF Error {h}: {e}")
+
+            # --- AtCoder ---
+            for h in user_data["ac"]:
+                try:
+                    r = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={h}&from_second={last_check.get(h, 0)}", timeout=10).json()
+                    for sub in sorted(r, key=lambda x: x.get("epoch_second", 0)):
+                        tm = sub.get("epoch_second", 0)
                         if tm > last_check.get(h, 0):
-                            res = sub.get("verdict", "TESTING")
-                            if res == "TESTING": continue
-                            p = sub["problem"]
-                            emoji = "✅" if res == "OK" else "❌"
-                            send_msg(f"{emoji} <b>{h}</b> (CF): {p['name']} | {res}")
+                            res = sub.get("result", "?")
+                            emoji = "✅" if res == "AC" else "❌"
+                            send_msg(chat_id, f"{emoji} <b>{h}</b> (AtCoder): {sub.get('problem_id')} | {res}")
                             last_check[h] = tm
-            except: pass
+                except Exception as e:
+                    print(f"AC Error {h}: {e}")
+                time.sleep(1)  # уважение к API AtCoder
+
         time.sleep(CHECK_INTERVAL)
 
-# --- Flask & Run ---
+# --- Flask для Render ---
 @app.route('/')
 def ping(): return "OK", 200
 
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080))), daemon=True).start()
+    print("Запуск систем...")
+    Thread(target=run_flask, daemon=True).start()
     Thread(target=check_updates, daemon=True).start()
-    print("Бот запущен...")
     bot.infinity_polling()
