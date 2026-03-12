@@ -1,6 +1,6 @@
 import os
 import time
-import json
+import sqlite3
 import requests
 import telebot
 import random
@@ -8,183 +8,174 @@ from threading import Thread
 from flask import Flask
 
 # ====== КОНФИГУРАЦИЯ ======
-TOKEN = os.environ.get("BOT_TOKEN")
-DATA_FILE = "users_data.json"
-CHECK_INTERVAL = 60
-
+TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН_СЮДА")
 bot = telebot.TeleBot(TOKEN)
 app = Flask('')
 
-# --- Работа с данными (Теперь по User ID) ---
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except: pass
-    return {}
+# ====== БАЗА ДАННЫХ ======
+def get_db_connection():
+    # check_same_thread=False нужен для работы с БД из разных потоков (веб-сервер и бот)
+    conn = sqlite3.connect('cf_bot.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Таблица привязки Telegram ID к CF нику
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (user_id TEXT PRIMARY KEY, handle TEXT)''')
+    # Таблица нерешенных задач из контестов
+    c.execute('''CREATE TABLE IF NOT EXISTS missed_tasks 
+                 (user_id TEXT, contest_id INTEGER, index_str TEXT, 
+                  name TEXT, rating INTEGER, tags TEXT, 
+                  UNIQUE(user_id, contest_id, index_str))''')
+    conn.commit()
+    conn.close()
 
-# Глобальное состояние (словарь словарей)
-users_state = load_data()
+init_db()
 
-def get_user_config(user_id):
-    user_id = str(user_id)
-    if user_id not in users_state:
-        users_state[user_id] = {"cf": [], "ac": []}
-    return users_state[user_id]
-
-# --- Команды бота ---
-
-@bot.message_handler(commands=['start', 'status'])
-def cmd_status(message):
-    cfg = get_user_config(message.from_user.id)
-    status_text = (
-        "🟢 <b>Бот активен</b>\n\n"
-        f"👤 Твои CF ники: <code>{', '.join(cfg['cf']) if cfg['cf'] else 'пусто'}</code>\n"
-        f"👤 Твои AC ники: <code>{', '.join(cfg['ac']) if cfg['ac'] else 'пусто'}</code>\n"
-        "📈 Режим: Индивидуальная БД включена"
-    )
-    bot.reply_to(message, status_text, parse_mode="HTML")
-
-@bot.message_handler(commands=['add'])
-def cmd_add(message):
+# ====== ЛОГИКА CODEFORCES ======
+def update_user_tasks(user_id, handle):
+    """Парсит 5 последних контестов юзера и ищет нерешенные задачи его уровня"""
     try:
-        parts = message.text.split()
-        if len(parts) < 3:
-            return bot.reply_to(message, "Формат: /add [cf/ac] [ник]")
+        # 1. Получаем инфу о пользователе (для рейтинга)
+        user_info = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5).json()
+        if user_info['status'] != 'OK': return False
+        current_rating = user_info['result'][0].get('rating', 800)
         
-        platform = parts[1].lower()
-        handle = parts[2]
-        user_id = str(message.from_user.id)
+        # Ограничение по уровню: задачи не ниже текущего рейтинга и не выше чем на 400 пунктов (2 ранга)
+        min_rating = max(800, current_rating - 100)
+        max_rating = current_rating + 400
 
-        if platform not in ["cf", "ac"]:
-            return bot.reply_to(message, "Платформы только cf или ac")
+        # 2. Получаем все сабмиты (чтобы отсеять решенное)
+        status_resp = requests.get(f"https://codeforces.com/api/user.status?handle={handle}", timeout=5).json()
+        solved_ids = set()
+        if status_resp['status'] == 'OK':
+            for sub in status_resp['result']:
+                if sub.get('verdict') == 'OK':
+                    solved_ids.add(f"{sub['problem']['contestId']}{sub['problem']['index']}")
 
-        cfg = get_user_config(user_id)
-        if handle in cfg[platform]:
-            return bot.reply_to(message, "Уже добавлен в твой список.")
+        # 3. Получаем последние контесты пользователя
+        rating_resp = requests.get(f"https://codeforces.com/api/user.rating?handle={handle}", timeout=5).json()
+        if rating_resp['status'] != 'OK' or not rating_resp['result']: return False
+        
+        last_5_contests = [c['contestId'] for c in rating_resp['result'][-5:]]
 
-        # Проверка ника
-        if platform == "cf":
-            r = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5).json()
-            if r.get("status") != "OK":
-                return bot.reply_to(message, "❌ Ник на CF не найден")
-
-        cfg[platform].append(handle)
-        save_data(users_state)
-        bot.reply_to(message, f"✅ {handle} добавлен в твой список!")
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # 4. Ищем задачи в этих контестах
+        for c_id in last_5_contests:
+            time.sleep(0.5)  # Защита от бана CF API
+            standings = requests.get(f"https://codeforces.com/api/contest.standings?contestId={c_id}&from=1&count=1", timeout=5).json()
+            if standings['status'] == 'OK':
+                for p in standings['result']['problems']:
+                    p_id = f"{p.get('contestId')}{p.get('index')}"
+                    p_rating = p.get('rating', 0)
+                    
+                    # Проверяем, что задача не решена и подходит по рейтингу
+                    if p_id not in solved_ids and p_rating and (min_rating <= p_rating <= max_rating):
+                        tags_str = ",".join(p.get('tags', []))
+                        c.execute('''INSERT OR IGNORE INTO missed_tasks 
+                                     (user_id, contest_id, index_str, name, rating, tags) 
+                                     VALUES (?, ?, ?, ?, ?, ?)''', 
+                                  (user_id, p['contestId'], p['index'], p['name'], p_rating, tags_str))
+        conn.commit()
+        conn.close()
+        return True
     except Exception as e:
-        bot.reply_to(message, f"Ошибка при добавлении: {e}")
+        print(f"Ошибка парсинга: {e}")
+        return False
+
+# ====== КОМАНДЫ БОТА ======
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    bot.reply_to(message, "Привет. Используй /add_cf [твой_ник] для привязки аккаунта.\nЗатем используй /update для сбора базы задач и /suggest для получения задачи.")
+
+@bot.message_handler(commands=['add_cf'])
+def cmd_add_cf(message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return bot.reply_to(message, "Формат: /add_cf [ник]")
+    
+    handle = parts[1]
+    user_id = str(message.from_user.id)
+    
+    # Проверка существования аккаунта
+    try:
+        r = requests.get(f"https://codeforces.com/api/user.info?handles={handle}", timeout=5).json()
+        if r.get('status') != 'OK':
+            return bot.reply_to(message, "❌ Ник на CF не найден.")
+    except:
+        return bot.reply_to(message, "❌ Ошибка соединения с Codeforces.")
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO users (user_id, handle) VALUES (?, ?)", (user_id, handle))
+    conn.commit()
+    conn.close()
+    
+    bot.reply_to(message, f"✅ Аккаунт {handle} привязан. Нажми /update чтобы собрать задачи из твоих контестов.")
+
+@bot.message_handler(commands=['update'])
+def cmd_update(message):
+    user_id = str(message.from_user.id)
+    conn = get_db_connection()
+    user = conn.execute("SELECT handle FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    
+    if not user:
+        return bot.reply_to(message, "Сначала привяжи ник через /add_cf [ник]")
+    
+    handle = user['handle']
+    bot.reply_to(message, f"⏳ Начинаю анализ твоих последних 5 контестов для {handle}. Это займет пару секунд...")
+    
+    if update_user_tasks(user_id, handle):
+        conn = get_db_connection()
+        count = conn.execute("SELECT COUNT(*) FROM missed_tasks WHERE user_id = ?", (user_id,)).fetchone()[0]
+        conn.close()
+        bot.reply_to(message, f"✅ База обновлена. Доступно задач для дорешивания: {count}.")
+    else:
+        bot.reply_to(message, "❌ Ошибка при обновлении. Возможно, API Codeforces недоступен или ты не писал контесты.")
 
 @bot.message_handler(commands=['suggest'])
 def cmd_suggest(message):
-    try:
-        parts = message.text.split()
-        user_id = str(message.from_user.id)
-        cfg = get_user_config(user_id)
-
-        if len(parts) < 2:
-            if not cfg['cf']:
-                return bot.reply_to(message, "Сначала добавь ник: /add cf твой_ник")
-            handle = cfg['cf'][0]
-        else:
-            handle = parts[1]
-
-        bot.send_chat_action(message.chat.id, 'typing')
-
-        # 1. Данные пользователя
-        user_info = requests.get(f"https://codeforces.com/api/user.info?handles={handle}").json()
-        user_status = requests.get(f"https://codeforces.com/api/user.status?handle={handle}").json()
+    user_id = str(message.from_user.id)
+    conn = get_db_connection()
+    
+    # Берем случайную задачу пользователя
+    task = conn.execute("SELECT * FROM missed_tasks WHERE user_id = ? ORDER BY RANDOM() LIMIT 1", (user_id,)).fetchone()
+    
+    if not task:
+        conn.close()
+        return bot.reply_to(message, "Твоя база задач пуста. Вызови /update чтобы собрать их.")
         
-        if user_info['status'] != "OK": return bot.reply_to(message, "Ошибка API")
+    contest_id = task['contest_id']
+    index = task['index_str']
+    
+    # Удаляем выданную задачу из БД (чтобы не предлагать дважды)
+    conn.execute("DELETE FROM missed_tasks WHERE user_id = ? AND contest_id = ? AND index_str = ?", 
+                 (user_id, contest_id, index))
+    conn.commit()
+    conn.close()
+    
+    link = f"https://codeforces.com/contest/{contest_id}/problem/{index}"
+    text = (
+        f"🎯 <b>Задача для тебя:</b>\n\n"
+        f"<b>{task['name']}</b>\n"
+        f"Рейтинг: {task['rating']}\n"
+        f"Теги: <code>{task['tags']}</code>\n\n"
+        f"🔗 <a href='{link}'>Перейти к задаче</a>"
+    )
+    bot.reply_to(message, text, parse_mode="HTML", disable_web_page_preview=True)
 
-        rating = user_info['result'][0].get('rating', 800)
-        
-        # Маппинг тегов (твой роадмап)
-        if rating <= 999:
-            target_tags, min_r, max_r = ["brute force", "sortings", "math"], 800, 1000
-        elif rating <= 1199:
-            target_tags, min_r, max_r = ["math", "binary search", "two pointers", "dp"], 1000, 1200
-        elif rating <= 1399:
-            target_tags, min_r, max_r = ["graphs", "dsu", "trees", "dp"], 1200, 1400
-        elif rating <= 1599:
-            target_tags, min_r, max_r = ["constructive algorithms", "shortest paths", "probabilities"], 1400, 1600
-        else:
-            target_tags, min_r, max_r = ["dp", "data structures", "games"], 1600, 2000
-
-        # Анализ решенных задач и поиск слабого тега
-        tag_stats = {tag: 0 for tag in target_tags}
-        solved_ids = set()
-        for sub in user_status['result']:
-            if sub.get('verdict') == 'OK':
-                p = sub['problem']
-                solved_ids.add(f"{p.get('contestId')}{p.get('index')}")
-                for tag in p.get('tags', []):
-                    if tag in tag_stats: tag_stats[tag] += 1
-        
-        weak_tag = min(tag_stats, key=tag_stats.get)
-
-        # === НОВАЯ ЛОГИКА: Поиск в последних 5 контестах ===
-        pool = []
-        try:
-            contests = requests.get("https://codeforces.com/api/contest.list?gym=false").json()['result']
-            recent_ids = [c['id'] for c in contests if c['phase'] == 'FINISHED'][:5]
-            
-            for c_id in recent_ids:
-                c_data = requests.get(f"https://codeforces.com/api/contest.standings?contestId={c_id}&from=1&count=1").json()
-                if c_data['status'] == "OK":
-                    for p in c_data['result']['problems']:
-                        p_id = f"{p.get('contestId')}{p.get('index')}"
-                        p_rating = p.get('rating', 0)
-                        if p_id not in solved_ids and p_rating and (min_r <= p_rating <= max_r):
-                            if weak_tag in p.get('tags', []):
-                                pool.append(p)
-        except: pass
-
-        source_info = "Последние контесты"
-        
-        # Если в новых контестах не нашли, ищем по всей базе (старая логика)
-        if not pool:
-            source_info = "Общий архив"
-            all_probs = requests.get("https://codeforces.com/api/problemset.problems").json()
-            for p in all_probs['result']['problems']:
-                p_id = f"{p.get('contestId')}{p.get('index')}"
-                p_rating = p.get('rating', 0)
-                if p_id not in solved_ids and p_rating and (min_r <= p_rating <= max_r):
-                    if weak_tag in p.get('tags', []):
-                        pool.append(p)
-
-        if not pool:
-            return bot.reply_to(message, f"Нет задач по тегу {weak_tag}. Попробуй позже.")
-
-        p = random.choice(pool)
-        link = f"https://codeforces.com/contest/{p['contestId']}/problem/{p['index']}"
-        
-        bot.reply_to(message, (
-            f"🎯 <b>Suggest для {handle}</b>\n"
-            f"Слабый тег: <code>#{weak_tag}</code>\n"
-            f"Источник: {source_info}\n\n"
-            f"Задача: <b>{p['name']}</b> ({p.get('rating')})\n"
-            f"🔗 <a href='{link}'>Перейти к задаче</a>"
-        ), parse_mode="HTML", disable_web_page_preview=True)
-
-    except Exception as e:
-        bot.reply_to(message, "Ошибка в логике suggest.")
-
-# --- Очистка и запуск (мониторинг остается общим, но берет всех из базы) ---
-def check_updates():
-    # Чтобы не нагружать API, здесь можно оставить упрощенную проверку
-    # или переделать под всех пользователей в users_state
-    pass
-
+# ====== ВЕБ-СЕРВЕР ======
 @app.route('/')
 def ping(): return "OK", 200
 
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
+    port = int(os.environ.get('PORT', 10000))
+    Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
     print("Бот запущен...")
     bot.infinity_polling()
